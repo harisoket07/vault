@@ -10,6 +10,17 @@
  * - Persistance dans PostgreSQL (compatible Neon / Supabase /
  *   Render Postgres — tous ont un tier gratuit), via DATABASE_URL
  * - Compatible Express 5
+ *
+ * DURCISSEMENT DE SÉCURITÉ (voir commentaires "🔒 SÉCURITÉ") :
+ *  - En-têtes de sécurité (helmet)
+ *  - Limitation de débit sur les routes sensibles (rate limiting)
+ *  - Suppression de la fuite de timing sur /api/login
+ *  - Vérification que l'utilisateur existe encore à chaque requête authentifiée
+ *  - Contrainte UNIQUE en base pour éviter les doublons d'inscription
+ *  - Limites de taille sur les champs utilisateur
+ *
+ * Dépendances à installer :
+ *   npm install express pg bcryptjs jsonwebtoken helmet express-rate-limit
  */
 
 const express = require("express");
@@ -17,6 +28,8 @@ const path = require("path");
 const crypto = require("crypto");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const helmet = require("helmet");
+const rateLimit = require("express-rate-limit");
 const { Pool } = require("pg");
 
 const app = express();
@@ -97,17 +110,88 @@ async function initSchema() {
 }
 
 /* ============================================================
+   🔒 SÉCURITÉ — EN-TÊTES HTTP
+   ------------------------------------------------------------
+   CSP adaptée : si ton front (public/index.html) contient du
+   script/style inline, 'unsafe-inline' reste nécessaire pour ne
+   pas casser l'appli sans refactor. cdnjs.cloudflare.com est
+   autorisé pour three.js — adapte si tu utilises d'autres CDN.
+============================================================ */
+
+app.use(
+    helmet({
+        contentSecurityPolicy: {
+            directives: {
+                defaultSrc: ["'self'"],
+                scriptSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com"],
+                styleSrc: ["'self'", "'unsafe-inline'"],
+                imgSrc: ["'self'", "data:"],
+                connectSrc: ["'self'"],
+                objectSrc: ["'none'"],
+                frameAncestors: ["'none'"],
+                baseUri: ["'self'"],
+                formAction: ["'self'"]
+            }
+        },
+        crossOriginEmbedderPolicy: false
+    })
+);
+
+/* ============================================================
+   🔒 SÉCURITÉ — LIMITATION DE DÉBIT
+============================================================ */
+
+const authLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Trop de tentatives. Réessayez dans quelques minutes." }
+});
+
+const apiLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Trop de requêtes. Ralentissez un peu." }
+});
+
+/* ============================================================
    MIDDLEWARE
 ============================================================ */
 
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(PUBLIC_PATH));
+app.use("/api/", apiLimiter);
+
+/* ============================================================
+   🔒 SÉCURITÉ — VALIDATION DES ENTRÉES
+============================================================ */
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function isValidEmail(email) {
+    return typeof email === "string" && EMAIL_REGEX.test(email) && email.length <= 254;
+}
+
+function isValidLength(value, min, max) {
+    return typeof value === "string" && value.length >= min && value.length <= max;
+}
+
+// Hash factice utilisé pour égaliser le temps de réponse quand l'email
+// n'existe pas (voir /api/login) — jamais utilisé pour un vrai compte.
+const DUMMY_HASH = bcrypt.hashSync("dummy-password-for-timing", 12);
 
 /* ============================================================
    AUTHENTIFICATION JWT
+   🔒 SÉCURITÉ : vérifie désormais que l'utilisateur existe encore
+   en base, pas seulement que le token est signé correctement —
+   un token émis avant la suppression d'un compte devient donc
+   inutilisable immédiatement.
 ============================================================ */
 
-function authenticate(req, res, next) {
+async function authenticate(req, res, next) {
     const header = req.headers.authorization || "";
 
     if (!header.startsWith("Bearer ")) {
@@ -124,6 +208,14 @@ function authenticate(req, res, next) {
         if (!decoded || !decoded.sub) {
             return res.status(401).json({
                 error: "Session invalide."
+            });
+        }
+
+        const result = await pool.query("SELECT id FROM users WHERE id = $1", [decoded.sub]);
+
+        if (result.rows.length === 0) {
+            return res.status(401).json({
+                error: "Ce compte n'existe plus."
             });
         }
 
@@ -160,9 +252,13 @@ app.get("/api", async (req, res) => {
 
 /* ============================================================
    INSCRIPTION
+   🔒 SÉCURITÉ : la contrainte UNIQUE(email) empêche deux
+   inscriptions concurrentes de créer un doublon — Postgres
+   rejette la seconde insertion (code 23505) même si les deux
+   requêtes arrivent quasi simultanément.
 ============================================================ */
 
-app.post("/api/register", async (req, res) => {
+app.post("/api/register", authLimiter, async (req, res) => {
     try {
         const { name, email, password } = req.body || {};
 
@@ -172,48 +268,45 @@ app.post("/api/register", async (req, res) => {
             });
         }
 
-        if (String(password).length < 8) {
+        const normalizedEmail = String(email).trim().toLowerCase();
+        const normalizedName = String(name).trim();
+
+        if (!isValidEmail(normalizedEmail)) {
             return res.status(400).json({
-                error: "Le mot de passe doit contenir au moins 8 caractères."
+                error: "Adresse email invalide."
             });
         }
 
-        const normalizedEmail =
-            String(email).trim().toLowerCase();
-
-        const normalizedName =
-            String(name).trim();
-
-        if (!normalizedName) {
+        if (!isValidLength(normalizedName, 1, 100)) {
             return res.status(400).json({
-                error: "Le nom est invalide."
+                error: "Le nom doit contenir entre 1 et 100 caractères."
             });
         }
 
-        const existing = await pool.query(
-            "SELECT id FROM users WHERE email = $1",
-            [normalizedEmail]
-        );
-
-        if (existing.rows.length > 0) {
-            return res.status(409).json({
-                error: "Un compte existe déjà avec cette adresse."
+        if (!isValidLength(String(password), 8, 128)) {
+            return res.status(400).json({
+                error: "Le mot de passe doit contenir entre 8 et 128 caractères."
             });
         }
 
-        const passwordHash =
-            await bcrypt.hash(password, 12);
-
-        const vaultSalt =
-            crypto.randomBytes(16).toString("base64");
-
+        const passwordHash = await bcrypt.hash(password, 12);
+        const vaultSalt = crypto.randomBytes(16).toString("base64");
         const userId = crypto.randomUUID();
 
-        await pool.query(
-            `INSERT INTO users (id, name, email, password_hash, vault_salt)
-             VALUES ($1, $2, $3, $4, $5)`,
-            [userId, normalizedName, normalizedEmail, passwordHash, vaultSalt]
-        );
+        try {
+            await pool.query(
+                `INSERT INTO users (id, name, email, password_hash, vault_salt)
+                 VALUES ($1, $2, $3, $4, $5)`,
+                [userId, normalizedName, normalizedEmail, passwordHash, vaultSalt]
+            );
+        } catch (error) {
+            if (error.code === "23505") { // unique_violation
+                return res.status(409).json({
+                    error: "Un compte existe déjà avec cette adresse."
+                });
+            }
+            throw error;
+        }
 
         const token = jwt.sign(
             { sub: userId },
@@ -242,9 +335,12 @@ app.post("/api/register", async (req, res) => {
 
 /* ============================================================
    CONNEXION
+   🔒 SÉCURITÉ : bcrypt.compare s'exécute TOUJOURS, contre le vrai
+   hash si l'utilisateur existe, contre un hash factice sinon — le
+   temps de réponse ne révèle donc pas si l'email est enregistré.
 ============================================================ */
 
-app.post("/api/login", async (req, res) => {
+app.post("/api/login", authLimiter, async (req, res) => {
     try {
         const { email, password } = req.body || {};
 
@@ -254,26 +350,18 @@ app.post("/api/login", async (req, res) => {
             });
         }
 
-        const normalizedEmail =
-            String(email).trim().toLowerCase();
+        const normalizedEmail = String(email).trim().toLowerCase();
 
         const result = await pool.query(
             "SELECT * FROM users WHERE email = $1",
             [normalizedEmail]
         );
 
-        const user = result.rows[0];
+        const user = result.rows[0] || null;
+        const hashToCheck = user ? user.password_hash : DUMMY_HASH;
+        const valid = await bcrypt.compare(password, hashToCheck);
 
-        if (!user) {
-            return res.status(401).json({
-                error: "Email ou mot de passe incorrect."
-            });
-        }
-
-        const valid =
-            await bcrypt.compare(password, user.password_hash);
-
-        if (!valid) {
+        if (!user || !valid) {
             return res.status(401).json({
                 error: "Email ou mot de passe incorrect."
             });
@@ -396,6 +484,9 @@ app.get("/api/vault", authenticate, async (req, res) => {
 
 /* ============================================================
    AJOUTER UNE ENTRÉE
+   🔒 SÉCURITÉ : limites de longueur sur chaque champ pour éviter
+   qu'un utilisateur authentifié ne gonfle indéfiniment la base
+   avec des entrées démesurées.
 ============================================================ */
 
 app.post("/api/vault", authenticate, async (req, res) => {
@@ -414,11 +505,22 @@ app.post("/api/vault", authenticate, async (req, res) => {
             });
         }
 
+        if (
+            !isValidLength(String(name), 1, 200) ||
+            !isValidLength(String(user), 1, 200) ||
+            !isValidLength(String(passwordCipher), 1, 10000) ||
+            !isValidLength(String(iv), 1, 200)
+        ) {
+            return res.status(400).json({
+                error: "Un ou plusieurs champs dépassent la longueur autorisée."
+            });
+        }
+
         const entryId = crypto.randomUUID();
 
         const cleanIcon =
             typeof icon === "string" && icon.trim()
-                ? icon.trim()
+                ? icon.trim().slice(0, 4)
                 : "🔐";
 
         const result = await pool.query(
@@ -451,6 +553,9 @@ app.post("/api/vault", authenticate, async (req, res) => {
 
 /* ============================================================
    SUPPRIMER UNE ENTRÉE
+   Le filtre "AND user_id = $2" empêche un utilisateur de
+   supprimer une entrée appartenant à quelqu'un d'autre, même en
+   devinant son identifiant.
 ============================================================ */
 
 app.delete("/api/vault/:id", authenticate, async (req, res) => {
