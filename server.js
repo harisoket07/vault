@@ -1,28 +1,3 @@
-/**
- * VaultBridge — server.js
- * ------------------------------------------------------------
- * Backend Express pour VaultBridge
- *
- * - Mots de passe de comptes hashés avec bcrypt
- * - Coffre chiffré côté navigateur (le serveur ne voit jamais
- *   les mots de passe en clair, seulement le texte chiffré)
- * - Sessions JWT
- * - Persistance dans PostgreSQL (compatible Neon / Supabase /
- *   Render Postgres — tous ont un tier gratuit), via DATABASE_URL
- * - Compatible Express 5
- *
- * DURCISSEMENT DE SÉCURITÉ (voir commentaires "🔒 SÉCURITÉ") :
- *  - En-têtes de sécurité (helmet)
- *  - Limitation de débit sur les routes sensibles (rate limiting)
- *  - Suppression de la fuite de timing sur /api/login
- *  - Vérification que l'utilisateur existe encore à chaque requête authentifiée
- *  - Contrainte UNIQUE en base pour éviter les doublons d'inscription
- *  - Limites de taille sur les champs utilisateur
- *
- * Dépendances à installer :
- *   npm install express pg bcryptjs jsonwebtoken helmet express-rate-limit
- */
-
 const express = require("express");
 const path = require("path");
 const crypto = require("crypto");
@@ -62,14 +37,6 @@ if (!DATABASE_URL) {
 
 const PUBLIC_PATH = path.join(__dirname, "public");
 
-/* ============================================================
-   BASE DE DONNÉES POSTGRESQL
-============================================================ */
-
-// La plupart des fournisseurs gratuits (Neon, Supabase, Render)
-// exigent SSL mais utilisent des certificats auto-signés en
-// interne — rejectUnauthorized:false est la config standard pour
-// ces plateformes en production.
 const pool = new Pool({
     connectionString: DATABASE_URL,
     ssl:
@@ -109,15 +76,6 @@ async function initSchema() {
     `);
 }
 
-/* ============================================================
-   🔒 SÉCURITÉ — EN-TÊTES HTTP
-   ------------------------------------------------------------
-   CSP adaptée : si ton front (public/index.html) contient du
-   script/style inline, 'unsafe-inline' reste nécessaire pour ne
-   pas casser l'appli sans refactor. cdnjs.cloudflare.com est
-   autorisé pour three.js — adapte si tu utilises d'autres CDN.
-============================================================ */
-
 app.use(
     helmet({
         contentSecurityPolicy: {
@@ -137,10 +95,6 @@ app.use(
     })
 );
 
-/* ============================================================
-   🔒 SÉCURITÉ — LIMITATION DE DÉBIT
-============================================================ */
-
 const authLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
@@ -157,17 +111,9 @@ const apiLimiter = rateLimit({
     message: { error: "Trop de requêtes. Ralentissez un peu." }
 });
 
-/* ============================================================
-   MIDDLEWARE
-============================================================ */
-
 app.use(express.json({ limit: "1mb" }));
 app.use(express.static(PUBLIC_PATH));
 app.use("/api/", apiLimiter);
-
-/* ============================================================
-   🔒 SÉCURITÉ — VALIDATION DES ENTRÉES
-============================================================ */
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -178,18 +124,7 @@ function isValidEmail(email) {
 function isValidLength(value, min, max) {
     return typeof value === "string" && value.length >= min && value.length <= max;
 }
-
-// Hash factice utilisé pour égaliser le temps de réponse quand l'email
-// n'existe pas (voir /api/login) — jamais utilisé pour un vrai compte.
 const DUMMY_HASH = bcrypt.hashSync("dummy-password-for-timing", 12);
-
-/* ============================================================
-   AUTHENTIFICATION JWT
-   🔒 SÉCURITÉ : vérifie désormais que l'utilisateur existe encore
-   en base, pas seulement que le token est signé correctement —
-   un token émis avant la suppression d'un compte devient donc
-   inutilisable immédiatement.
-============================================================ */
 
 async function authenticate(req, res, next) {
     const header = req.headers.authorization || "";
@@ -229,10 +164,6 @@ async function authenticate(req, res, next) {
     }
 }
 
-/* ============================================================
-   ROUTE DE TEST
-============================================================ */
-
 app.get("/api", async (req, res) => {
     let dbOk = true;
 
@@ -249,14 +180,6 @@ app.get("/api", async (req, res) => {
         database: dbOk ? "connected" : "unreachable"
     });
 });
-
-/* ============================================================
-   INSCRIPTION
-   🔒 SÉCURITÉ : la contrainte UNIQUE(email) empêche deux
-   inscriptions concurrentes de créer un doublon — Postgres
-   rejette la seconde insertion (code 23505) même si les deux
-   requêtes arrivent quasi simultanément.
-============================================================ */
 
 app.post("/api/register", authLimiter, async (req, res) => {
     try {
@@ -333,13 +256,6 @@ app.post("/api/register", authLimiter, async (req, res) => {
     }
 });
 
-/* ============================================================
-   CONNEXION
-   🔒 SÉCURITÉ : bcrypt.compare s'exécute TOUJOURS, contre le vrai
-   hash si l'utilisateur existe, contre un hash factice sinon — le
-   temps de réponse ne révèle donc pas si l'email est enregistré.
-============================================================ */
-
 app.post("/api/login", authLimiter, async (req, res) => {
     try {
         const { email, password } = req.body || {};
@@ -392,10 +308,6 @@ app.post("/api/login", authLimiter, async (req, res) => {
     }
 });
 
-/* ============================================================
-   INFORMATIONS DU COMPTE
-============================================================ */
-
 app.get("/api/account", authenticate, async (req, res) => {
     try {
         const result = await pool.query(
@@ -426,11 +338,6 @@ app.get("/api/account", authenticate, async (req, res) => {
     }
 });
 
-/* ============================================================
-   SUPPRESSION DU COMPTE
-   (vault_entries est supprimé automatiquement via ON DELETE CASCADE)
-============================================================ */
-
 app.delete("/api/account", authenticate, async (req, res) => {
     try {
         const result = await pool.query(
@@ -457,10 +364,6 @@ app.delete("/api/account", authenticate, async (req, res) => {
     }
 });
 
-/* ============================================================
-   RÉCUPÉRER LE COFFRE
-============================================================ */
-
 app.get("/api/vault", authenticate, async (req, res) => {
     try {
         const result = await pool.query(
@@ -481,13 +384,6 @@ app.get("/api/vault", authenticate, async (req, res) => {
         });
     }
 });
-
-/* ============================================================
-   AJOUTER UNE ENTRÉE
-   🔒 SÉCURITÉ : limites de longueur sur chaque champ pour éviter
-   qu'un utilisateur authentifié ne gonfle indéfiniment la base
-   avec des entrées démesurées.
-============================================================ */
 
 app.post("/api/vault", authenticate, async (req, res) => {
     try {
@@ -551,13 +447,6 @@ app.post("/api/vault", authenticate, async (req, res) => {
     }
 });
 
-/* ============================================================
-   SUPPRIMER UNE ENTRÉE
-   Le filtre "AND user_id = $2" empêche un utilisateur de
-   supprimer une entrée appartenant à quelqu'un d'autre, même en
-   devinant son identifiant.
-============================================================ */
-
 app.delete("/api/vault/:id", authenticate, async (req, res) => {
     try {
         const result = await pool.query(
@@ -583,13 +472,6 @@ app.delete("/api/vault/:id", authenticate, async (req, res) => {
     }
 });
 
-/* ============================================================
-   ROUTE SPA
-   ------------------------------------------------------------
-   Express 5 n'accepte plus app.get("*").
-   On utilise un middleware final à la place.
-============================================================ */
-
 app.use((req, res, next) => {
     if (req.method !== "GET") {
         return next();
@@ -612,10 +494,6 @@ app.use((req, res, next) => {
     });
 });
 
-/* ============================================================
-   GESTION DES ERREURS
-============================================================ */
-
 app.use((err, req, res, next) => {
     console.error("Erreur serveur :", err);
 
@@ -627,10 +505,6 @@ app.use((err, req, res, next) => {
         error: "Erreur interne du serveur."
     });
 });
-
-/* ============================================================
-   DÉMARRAGE
-============================================================ */
 
 initSchema()
     .then(() => {
